@@ -610,23 +610,102 @@ def get_sales_order(order_id):
 
 
 def order_edited(payload, request_id=None, store_name=None):
-    """Handler for orders/edited webhook.
+    """Apply Shopify order edits to the existing ERPNext Sales Order.
 
-    This does NOT modify any ERP documents. It simply records that an edited
-    order payload was received so that custom ERP logic (e.g. server scripts
-    or custom apps) can read the full JSON from Ecommerce Integration Log
-    and decide what to do (show banner, compare changes, etc.).
+    Behaviour is similar in spirit to other order webhooks:
+    - If a Sales Order does not exist yet, fall back to sync_sales_order (orders/create flow).
+    - If it exists, rebuild items & taxes from the edited Shopify order and update the SO.
     """
     frappe.set_user("Administrator")
     frappe.flags.request_id = request_id
 
+    order = payload
+
+    # Set store context like other handlers
     if store_name:
         frappe.local.shopify_store_name = store_name
-        log_store2("EDITED-1", f"orders/edited received for store {store_name}", store_name)
+        log_store2(
+            "EDITED-1",
+            f"orders/edited received for store {store_name}, order_id={order.get('id')}",
+            store_name,
+        )
 
-    # The full payload is already stored by process_request in Ecommerce Integration Log.
-    # Here we just create a simple success log entry for traceability.
-    create_shopify_log(status="Success", message="orders/edited webhook received")
+    try:
+        setting = frappe.get_doc(SETTING_DOCTYPE)
+
+        # Try to get existing SO by Shopify order id
+        sales_order = get_sales_order(order.get("id"))
+
+        # If SO doesn't exist yet, behave like orders/create
+        if not sales_order:
+            log_store2("EDITED-NEW", "No Sales Order found, calling sync_sales_order()", store_name)
+            sync_sales_order(order, request_id=request_id, store_name=store_name)
+            create_shopify_log(status="Success", message="orders/edited -> created new Sales Order")
+            return
+
+        log_store2("EDITED-2", f"Updating existing Sales Order {sales_order.name}", store_name)
+
+        # Rebuild items & taxes from edited Shopify order
+        items = get_order_items(
+            order.get("line_items", []),
+            setting,
+            getdate(order.get("created_at")),
+            taxes_inclusive=order.get("taxes_included"),
+            store_name=store_name,
+        )
+
+        if not items:
+            msg = "orders/edited: No items returned from get_order_items, aborting update."
+            log_store2("EDITED-FAIL-ITEMS", msg, store_name)
+            create_shopify_log(status="Error", exception=msg, rollback=True)
+            return
+
+        taxes = get_order_taxes(order, setting, items)
+
+        # Determine customer like in create_sales_order
+        customer = setting.default_customer
+        if order.get("customer", {}):
+            if customer_id := order.get("customer", {}).get("id"):
+                customer = (
+                    frappe.db.get_value("Customer", {CUSTOMER_ID_FIELD: customer_id}, "name")
+                    or customer
+                )
+
+        sales_order.customer = customer
+        sales_order.transaction_date = getdate(order.get("created_at")) or nowdate()
+        sales_order.delivery_date = getdate(order.get("created_at")) or nowdate()
+
+        # Replace items
+        sales_order.set("items", [])
+        for row in items:
+            sales_order.append("items", row)
+
+        # Replace taxes
+        sales_order.set("taxes", [])
+        for row in taxes:
+            sales_order.append("taxes", row)
+
+        # Optional: update note as a comment, similar to create_sales_order
+        if order.get("note"):
+            sales_order.add_comment(text=f"Order Note (edited): {order.get('note')}")
+
+        # Optional: update custom status field from financial_status, if present
+        if order.get("financial_status"):
+            sales_order.set(ORDER_STATUS_FIELD, order.get("financial_status"))
+
+        log_store2("EDITED-3", f"Saving updated Sales Order {sales_order.name}", store_name)
+        sales_order.save(ignore_permissions=True)
+
+        # Keep docstatus as-is; if it was submitted, we leave it submitted
+        if sales_order.docstatus == 0:
+            sales_order.submit()
+
+        log_store2("EDITED-OK", f"Sales Order {sales_order.name} updated from orders/edited", store_name)
+        create_shopify_log(status="Success", message="orders/edited webhook applied to Sales Order")
+
+    except Exception as e:
+        log_store2("EDITED-ERROR", f"Error: {str(e)}\n{traceback.format_exc()}", store_name)
+        create_shopify_log(status="Error", exception=e, rollback=True)
 
 
 def cancel_order(payload, request_id=None, store_name=None):
