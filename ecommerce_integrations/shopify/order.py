@@ -609,6 +609,26 @@ def get_sales_order(order_id):
         return frappe.get_doc("Sales Order", sales_order)
 
 
+def order_edited(payload, request_id=None, store_name=None):
+    """Handler for orders/edited webhook.
+
+    This does NOT modify any ERP documents. It simply records that an edited
+    order payload was received so that custom ERP logic (e.g. server scripts
+    or custom apps) can read the full JSON from Ecommerce Integration Log
+    and decide what to do (show banner, compare changes, etc.).
+    """
+    frappe.set_user("Administrator")
+    frappe.flags.request_id = request_id
+
+    if store_name:
+        frappe.local.shopify_store_name = store_name
+        log_store2("EDITED-1", f"orders/edited received for store {store_name}", store_name)
+
+    # The full payload is already stored by process_request in Ecommerce Integration Log.
+    # Here we just create a simple success log entry for traceability.
+    create_shopify_log(status="Success", message="orders/edited webhook received")
+
+
 def cancel_order(payload, request_id=None, store_name=None):
     """Called by order/cancelled event."""
     frappe.set_user("Administrator")
