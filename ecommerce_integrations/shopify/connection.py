@@ -25,8 +25,24 @@ from ecommerce_integrations.shopify.constants import (
 from ecommerce_integrations.shopify.utils import create_shopify_log
 
 
+def _is_debug_logging_enabled() -> bool:
+    """Check Shopify Setting for debug logging flag.
+
+    This is intentionally lightweight and tolerant of errors; if the
+    setting cannot be loaded we simply treat debug as disabled.
+    """
+    try:
+        setting = frappe.get_cached_doc(SETTING_DOCTYPE)
+        return bool(getattr(setting, "enable_debug_logging", 0))
+    except Exception:
+        return False
+
+
 def log_store2(step, message, store_name=None):
-    """Helper function to log only for Store 2."""
+    """Helper function to log only for Store 2 when debug logging is enabled."""
+    if not _is_debug_logging_enabled():
+        return
+
     if store_name and store_name != "Store 1":
         frappe.log_error(
             title=f"[STORE2 DEBUG] Step {step}",

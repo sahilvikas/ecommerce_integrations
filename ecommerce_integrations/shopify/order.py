@@ -35,8 +35,24 @@ DEFAULT_TAX_FIELDS = {
 }
 
 
+def _is_debug_logging_enabled() -> bool:
+    """Check Shopify Setting for debug logging flag.
+
+    This mirrors the check in connection.py but is kept local to avoid
+    circular imports.
+    """
+    try:
+        setting = frappe.get_cached_doc(SETTING_DOCTYPE)
+        return bool(getattr(setting, "enable_debug_logging", 0))
+    except Exception:
+        return False
+
+
 def log_store2(step, message, store_name=None):
-    """Helper function to log only for Store 2."""
+    """Helper function to log only for Store 2 when debug logging is enabled."""
+    if not _is_debug_logging_enabled():
+        return
+
     if store_name and store_name != "Store 1":
         frappe.log_error(
             title=f"[STORE2 ORDER] Step {step}",
@@ -748,12 +764,49 @@ def _discounts_differ(order, sales_order, store_name=None) -> bool:
     return False
 
 
-def _note_present(order, store_name=None) -> bool:
-    """Treat presence of a note as interesting (notes added/changed)."""
-    note = (order.get("note") or "").strip()
-    if note:
-        log_store2("UPDATED-NOTE", f"Order note present: {note}", store_name)
-        return True
+def _note_changed(order, sales_order, store_name=None) -> bool:
+    """Detect meaningful changes in the Shopify order note.
+
+    We compare the Shopify note against the latest ERPNext comment that starts
+    with "Order Note:" (same convention used when creating Sales Orders from
+    Shopify orders). This avoids treating every webhook for orders that simply
+    *have* a note as a change.
+    """
+    shopify_note = (order.get("note") or "").strip()
+
+    # Fetch latest relevant "Order Note:" comment on the Sales Order, if any
+    erp_note = ""
+    try:
+        comments = frappe.get_all(
+            "Comment",
+            filters={
+                "reference_doctype": "Sales Order",
+                "reference_name": sales_order.name,
+                "comment_type": "Comment",
+            },
+            fields=["content"],
+            order_by="creation desc",
+            limit=5,
+        )
+        for c in comments:
+            content = (c.get("content") or "").strip()
+            if "Order Note:" in content:
+                erp_note = content.replace("Order Note:", "").strip()
+                break
+    except Exception:
+        # If we can't load comments, fall back to simple presence check but
+        # don't treat it as a change unless Shopify actually has a note.
+        pass
+
+    if shopify_note != erp_note:
+        log_store2(
+            "UPDATED-NOTE",
+            f"Order note changed: ERP='{erp_note}' -> Shopify='{shopify_note}'",
+            store_name,
+        )
+        # Only treat as interesting if there is actually some content on either side
+        return bool(shopify_note or erp_note)
+
     return False
 
 
@@ -792,23 +845,20 @@ def is_valid_updated_order(order, sales_order, setting, store_name=None) -> bool
     Categories:
     - B: Address/contact change
     - C: Line items (qty/price) change
-    - D: Shipping price change
     - E: Discounts change
-    - Notes: note added/changed (treated as present)
+    - Notes: note added/changed (based on "Order Note:" comment vs Shopify note)
     - Tags/Properties: order tags or line item properties present
     """
     address_changed = _addresses_differ(order, sales_order, store_name)
     line_items_changed = _line_items_differ(order, sales_order, setting, store_name)
-    shipping_changed = _shipping_differ(order, sales_order, setting, store_name)
     discounts_changed = _discounts_differ(order, sales_order, store_name)
-    note_changed = _note_present(order, store_name)
+    note_changed = _note_changed(order, sales_order, store_name)
     metadata_changed = _tags_or_properties_present(order, store_name)
 
     any_change = any(
         [
             address_changed,
             line_items_changed,
-            shipping_changed,
             discounts_changed,
             note_changed,
             metadata_changed,
@@ -821,7 +871,6 @@ def is_valid_updated_order(order, sales_order, setting, store_name=None) -> bool
 orders/updated change summary:
   address_changed: {address_changed}
   line_items_changed: {line_items_changed}
-  shipping_changed: {shipping_changed}
   discounts_changed: {discounts_changed}
   note_changed: {note_changed}
   metadata_changed (tags/properties): {metadata_changed}

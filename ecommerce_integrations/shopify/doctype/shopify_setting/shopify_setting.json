@@ -14,6 +14,7 @@
   "shared_secret",
   "section_break_4",
   "webhooks",
+  "enable_debug_logging",
   "store_2_section",
   "enable_store_2",
   "store_2_name",
@@ -121,6 +122,13 @@
    "label": "Webhooks",
    "options": "Shopify Webhooks",
    "read_only": 1
+  },
+  {
+   "default": "0",
+   "description": "When enabled, verbose Store 2 debug logging will be written to the Error Log.",
+   "fieldname": "enable_debug_logging",
+   "fieldtype": "Check",
+   "label": "Enable Debug Logging (Store 2)"
   },
   {
    "collapsible": 1,
