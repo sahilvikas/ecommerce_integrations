@@ -609,102 +609,300 @@ def get_sales_order(order_id):
         return frappe.get_doc("Sales Order", sales_order)
 
 
-def order_edited(payload, request_id=None, store_name=None):
-    """Apply Shopify order edits to the existing ERPNext Sales Order.
+def _addresses_differ(order, sales_order, store_name=None) -> bool:
+    """Check if Shopify shipping/billing address differs from ERP addresses (category B)."""
+    changed = False
 
-    Behaviour is similar in spirit to other order webhooks:
-    - If a Sales Order does not exist yet, fall back to sync_sales_order (orders/create flow).
-    - If it exists, rebuild items & taxes from the edited Shopify order and update the SO.
+    shipping = order.get("shipping_address") or {}
+    billing = order.get("billing_address") or {}
+
+    # Compare shipping address with Sales Order's shipping_address_name (if any)
+    try:
+        if shipping and getattr(sales_order, "shipping_address_name", None):
+            so_shipping = frappe.get_doc("Address", sales_order.shipping_address_name)
+            if any(
+                [
+                    (so_shipping.address_line1 or "").strip() != (shipping.get("address1") or "").strip(),
+                    (so_shipping.address_line2 or "").strip() != (shipping.get("address2") or "").strip(),
+                    (so_shipping.city or "").strip() != (shipping.get("city") or "").strip(),
+                    (so_shipping.pincode or "").strip() != (shipping.get("zip") or "").strip(),
+                    (so_shipping.country or "").strip() != (shipping.get("country") or "").strip(),
+                    (so_shipping.state or "").strip() != (shipping.get("province") or "").strip(),
+                ]
+            ):
+                changed = True
+    except Exception:
+        # If we cannot resolve/compare address safely, don't treat it as a guaranteed change
+        pass
+
+    # Compare billing address with Sales Order's customer_address (if any)
+    try:
+        if billing and getattr(sales_order, "customer_address", None):
+            so_billing = frappe.get_doc("Address", sales_order.customer_address)
+            if any(
+                [
+                    (so_billing.address_line1 or "").strip() != (billing.get("address1") or "").strip(),
+                    (so_billing.address_line2 or "").strip() != (billing.get("address2") or "").strip(),
+                    (so_billing.city or "").strip() != (billing.get("city") or "").strip(),
+                    (so_billing.pincode or "").strip() != (billing.get("zip") or "").strip(),
+                    (so_billing.country or "").strip() != (billing.get("country") or "").strip(),
+                    (so_billing.state or "").strip() != (billing.get("province") or "").strip(),
+                ]
+            ):
+                changed = True
+    except Exception:
+        pass
+
+    if changed:
+        log_store2("UPDATED-B", "Detected address/contact changes", store_name)
+
+    return changed
+
+
+def _line_items_differ(order, sales_order, setting, store_name=None) -> bool:
+    """Check if Shopify line items differ from ERP items (category C)."""
+    shopify_items = order.get("line_items") or []
+
+    # Quick length check (number of non-shipping, non-fee items)
+    so_items = [row for row in sales_order.items if row.item_code]
+    if len(shopify_items) != len(so_items):
+        log_store2("UPDATED-C", "Line item count differs", store_name)
+        return True
+
+    # Build index of Sales Order items by item_code for comparison
+    so_index = {row.item_code: row for row in so_items}
+
+    taxes_inclusive = order.get("taxes_included")
+    for idx, shopify_item in enumerate(shopify_items):
+        item_code = get_item_code(shopify_item)
+        if not item_code:
+            # If we cannot resolve item code, skip strict comparison for this item
+            continue
+
+        so_row = so_index.get(item_code)
+        if not so_row:
+            log_store2("UPDATED-C-MISS", f"No matching Sales Order row for item_code={item_code}", store_name)
+            return True
+
+        expected_qty = cint(shopify_item.get("quantity"))
+        expected_rate = _get_item_price(shopify_item, taxes_inclusive)
+
+        if so_row.qty != expected_qty or flt(so_row.rate) != flt(expected_rate):
+            log_store2(
+                "UPDATED-C-DIFF",
+                f"Item mismatch for {item_code}: "
+                f"SO qty={so_row.qty}, Shopify qty={expected_qty}; "
+                f"SO rate={so_row.rate}, Shopify rate={expected_rate}",
+                store_name,
+            )
+            return True
+
+    return False
+
+
+def _shipping_differ(order, sales_order, setting, store_name=None) -> bool:
+    """Check if total shipping price differs (category D)."""
+    shipping_lines = order.get("shipping_lines") or []
+    if not shipping_lines:
+        return False
+
+    # Shopify shipping total from payload
+    shopify_shipping_total = sum(flt(sl.get("price") or 0) for sl in shipping_lines)
+
+    # ERP shipping via shipping item (if configured)
+    shipping_total_erp = 0.0
+    if getattr(setting, "shipping_item", None):
+        for row in sales_order.items:
+            if row.item_code == setting.shipping_item:
+                shipping_total_erp += flt(row.base_net_amount or row.net_amount or row.amount)
+
+    if shipping_total_erp and flt(shopify_shipping_total) != flt(shipping_total_erp):
+        log_store2(
+            "UPDATED-D",
+            f"Shipping total differs: SO={shipping_total_erp}, Shopify={shopify_shipping_total}",
+            store_name,
+        )
+        return True
+
+    return False
+
+
+def _discounts_differ(order, sales_order, store_name=None) -> bool:
+    """Check if total discounts differ (category E)."""
+    shopify_total_discounts = flt(order.get("total_discounts") or 0)
+
+    # Approximate ERP discount as sum of per-unit discount field * qty
+    erp_total_discounts = 0.0
+    for row in sales_order.items:
+        per_unit_disc = flt(getattr(row, ORDER_ITEM_DISCOUNT_FIELD, 0))
+        erp_total_discounts += per_unit_disc * flt(row.qty or 0)
+
+    if shopify_total_discounts and flt(shopify_total_discounts) != flt(erp_total_discounts):
+        log_store2(
+            "UPDATED-E",
+            f"Discount total differs: SO={erp_total_discounts}, Shopify={shopify_total_discounts}",
+            store_name,
+        )
+        return True
+
+    return False
+
+
+def _note_present(order, store_name=None) -> bool:
+    """Treat presence of a note as interesting (notes added/changed)."""
+    note = (order.get("note") or "").strip()
+    if note:
+        log_store2("UPDATED-NOTE", f"Order note present: {note}", store_name)
+        return True
+    return False
+
+
+def _tags_or_properties_present(order, store_name=None) -> bool:
+    """Treat tags or line item properties as interesting metadata changes.
+
+    We don't have a reliable previous snapshot in ERP for comparison,
+    so we consider the current presence of these fields as a signal
+    that this order carries important metadata for the banner.
+    """
+    tags = (order.get("tags") or "").strip()
+    has_tags = bool(tags)
+
+    has_properties = False
+    for li in order.get("line_items") or []:
+        props = li.get("properties") or []
+        # ignore empty placeholder properties
+        if any((p.get("name") or "").strip() or (p.get("value") or "").strip() for p in props):
+            has_properties = True
+            break
+
+    if has_tags or has_properties:
+        log_store2(
+            "UPDATED-META",
+            f"Order has metadata - tags_present={has_tags}, properties_present={has_properties}",
+            store_name,
+        )
+        return True
+
+    return False
+
+
+def is_valid_updated_order(order, sales_order, setting, store_name=None) -> bool:
+    """Return True only if orders/updated has changes we care about.
+
+    Categories:
+    - B: Address/contact change
+    - C: Line items (qty/price) change
+    - D: Shipping price change
+    - E: Discounts change
+    - Notes: note added/changed (treated as present)
+    - Tags/Properties: order tags or line item properties present
+    """
+    address_changed = _addresses_differ(order, sales_order, store_name)
+    line_items_changed = _line_items_differ(order, sales_order, setting, store_name)
+    shipping_changed = _shipping_differ(order, sales_order, setting, store_name)
+    discounts_changed = _discounts_differ(order, sales_order, store_name)
+    note_changed = _note_present(order, store_name)
+    metadata_changed = _tags_or_properties_present(order, store_name)
+
+    any_change = any(
+        [
+            address_changed,
+            line_items_changed,
+            shipping_changed,
+            discounts_changed,
+            note_changed,
+            metadata_changed,
+        ]
+    )
+
+    log_store2(
+        "UPDATED-SUMMARY",
+        f"""
+orders/updated change summary:
+  address_changed: {address_changed}
+  line_items_changed: {line_items_changed}
+  shipping_changed: {shipping_changed}
+  discounts_changed: {discounts_changed}
+  note_changed: {note_changed}
+  metadata_changed (tags/properties): {metadata_changed}
+  any_change: {any_change}
+""",
+        store_name,
+    )
+
+    return any_change
+
+
+def order_updated(payload, request_id=None, store_name=None):
+    """Handler for orders/updated webhook.
+
+    This is intentionally conservative:
+    - It only processes orders that already exist in ERP (no backfill/creation).
+    - It uses is_valid_updated_order to decide if there are meaningful changes
+      (categories B, C, D, E and notes). If not, it exits quietly.
+    - It does NOT mutate ERP documents; it just logs interesting updates that
+      your custom ERP logic can react to via Ecommerce Integration Log.
     """
     frappe.set_user("Administrator")
     frappe.flags.request_id = request_id
 
     order = payload
 
-    # Set store context like other handlers
     if store_name:
         frappe.local.shopify_store_name = store_name
         log_store2(
-            "EDITED-1",
-            f"orders/edited received for store {store_name}, order_id={order.get('id')}",
+            "UPDATED-1",
+            f"orders/updated received for store {store_name}, order_id={order.get('id')}",
             store_name,
         )
 
     try:
+        # Only proceed if Sales Order already exists; avoid creating historical orders.
+        sales_order = get_sales_order(order.get("id"))
+        if not sales_order:
+            log_store2(
+                "UPDATED-SKIP-NO-SO",
+                f"Skipping orders/updated; Sales Order not found for Shopify Order ID {order.get('id')}",
+                store_name,
+            )
+            create_shopify_log(
+                status="Invalid",
+                message="orders/updated skipped: Sales Order does not exist in ERP",
+            )
+            return
+
         setting = frappe.get_doc(SETTING_DOCTYPE)
 
-        # Try to get existing SO by Shopify order id
-        sales_order = get_sales_order(order.get("id"))
-
-        # If SO doesn't exist yet, behave like orders/create
-        if not sales_order:
-            log_store2("EDITED-NEW", "No Sales Order found, calling sync_sales_order()", store_name)
-            sync_sales_order(order, request_id=request_id, store_name=store_name)
-            create_shopify_log(status="Success", message="orders/edited -> created new Sales Order")
+        if not is_valid_updated_order(order, sales_order, setting, store_name):
+            log_store2(
+                "UPDATED-SKIP-NOCHANGE",
+                "orders/updated has no relevant changes (B/C/D/E/notes); deleting log and skipping.",
+                store_name,
+            )
+            # Delete the original Ecommerce Integration Log created in process_request
+            if request_id:
+                try:
+                    frappe.delete_doc("Ecommerce Integration Log", request_id, ignore_permissions=True)
+                except Exception as delete_err:
+                    log_store2(
+                        "UPDATED-DELETE-ERROR",
+                        f"Failed to delete Ecommerce Integration Log {request_id}: {delete_err}",
+                        store_name,
+                    )
             return
 
-        log_store2("EDITED-2", f"Updating existing Sales Order {sales_order.name}", store_name)
-
-        # Rebuild items & taxes from edited Shopify order
-        items = get_order_items(
-            order.get("line_items", []),
-            setting,
-            getdate(order.get("created_at")),
-            taxes_inclusive=order.get("taxes_included"),
-            store_name=store_name,
+        # At this point we have an existing Sales Order and meaningful changes.
+        # We deliberately don't mutate ERP docs here; your custom logic can read
+        # the original Ecommerce Integration Log (kept intact) and decide what to do.
+        create_shopify_log(status="Success", message="orders/updated with relevant changes detected")
+        log_store2(
+            "UPDATED-OK",
+            f"orders/updated logged with relevant changes for Sales Order {sales_order.name}",
+            store_name,
         )
 
-        if not items:
-            msg = "orders/edited: No items returned from get_order_items, aborting update."
-            log_store2("EDITED-FAIL-ITEMS", msg, store_name)
-            create_shopify_log(status="Error", exception=msg, rollback=True)
-            return
-
-        taxes = get_order_taxes(order, setting, items)
-
-        # Determine customer like in create_sales_order
-        customer = setting.default_customer
-        if order.get("customer", {}):
-            if customer_id := order.get("customer", {}).get("id"):
-                customer = (
-                    frappe.db.get_value("Customer", {CUSTOMER_ID_FIELD: customer_id}, "name")
-                    or customer
-                )
-
-        sales_order.customer = customer
-        sales_order.transaction_date = getdate(order.get("created_at")) or nowdate()
-        sales_order.delivery_date = getdate(order.get("created_at")) or nowdate()
-
-        # Replace items
-        sales_order.set("items", [])
-        for row in items:
-            sales_order.append("items", row)
-
-        # Replace taxes
-        sales_order.set("taxes", [])
-        for row in taxes:
-            sales_order.append("taxes", row)
-
-        # Optional: update note as a comment, similar to create_sales_order
-        if order.get("note"):
-            sales_order.add_comment(text=f"Order Note (edited): {order.get('note')}")
-
-        # Optional: update custom status field from financial_status, if present
-        if order.get("financial_status"):
-            sales_order.set(ORDER_STATUS_FIELD, order.get("financial_status"))
-
-        log_store2("EDITED-3", f"Saving updated Sales Order {sales_order.name}", store_name)
-        sales_order.save(ignore_permissions=True)
-
-        # Keep docstatus as-is; if it was submitted, we leave it submitted
-        if sales_order.docstatus == 0:
-            sales_order.submit()
-
-        log_store2("EDITED-OK", f"Sales Order {sales_order.name} updated from orders/edited", store_name)
-        create_shopify_log(status="Success", message="orders/edited webhook applied to Sales Order")
-
     except Exception as e:
-        log_store2("EDITED-ERROR", f"Error: {str(e)}\n{traceback.format_exc()}", store_name)
+        log_store2("UPDATED-ERROR", f"Error: {str(e)}\n{traceback.format_exc()}", store_name)
         create_shopify_log(status="Error", exception=e, rollback=True)
 
 
