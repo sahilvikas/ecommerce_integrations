@@ -14,8 +14,9 @@ WEBHOOK_EVENTS = [
 	"orders/fulfilled",
 	"orders/cancelled",
 	"orders/partially_fulfilled",
-	# Fires on many order updates (status, address, totals, etc.)
-	"orders/updated",
+	# orders/edited fires only on actual order edits (items added/removed/modified, address changes, etc.)
+	# This avoids the noise from orders/updated which fires on many irrelevant changes
+	"orders/edited",
 ]
 
 EVENT_MAPPER = {
@@ -24,7 +25,7 @@ EVENT_MAPPER = {
 	"orders/fulfilled": "ecommerce_integrations.shopify.fulfillment.prepare_delivery_note",
 	"orders/cancelled": "ecommerce_integrations.shopify.order.cancel_order",
 	"orders/partially_fulfilled": "ecommerce_integrations.shopify.fulfillment.prepare_delivery_note",
-	"orders/updated": "ecommerce_integrations.shopify.order.order_updated",
+	"orders/edited": "ecommerce_integrations.shopify.order.order_updated",
 }
 
 SHOPIFY_VARIANTS_ATTR_LIST = ["option1", "option2", "option3"]

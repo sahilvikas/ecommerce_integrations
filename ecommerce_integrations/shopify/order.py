@@ -839,8 +839,262 @@ def _tags_or_properties_present(order, store_name=None) -> bool:
     return False
 
 
+def _get_detailed_changes(order, sales_order, setting, store_name=None) -> dict:
+    """Get detailed breakdown of what changed: added, removed, modified items, properties, addresses.
+    
+    Returns a dictionary with:
+    - items_added: List of items that were added to the order
+    - items_removed: List of items that were removed from the order
+    - items_modified: List of items with quantity/price/property changes
+    - address_changed: Dictionary with shipping/billing address field changes
+    - note_changed: Boolean and note details
+    - discount_changed: Boolean and discount details
+    - tags_changed: Boolean and tag details
+    - properties_changed: List of line items with property changes
+    """
+    changes = {
+        "items_added": [],
+        "items_removed": [],
+        "items_modified": [],
+        "properties_changed": [],
+        "address_changed": {},
+        "note_changed": False,
+        "note_details": {},
+        "discount_changed": False,
+        "discount_details": {},
+        "tags_changed": False,
+        "tags_details": {},
+    }
+    
+    shopify_items = order.get("line_items") or []
+    so_items = [row for row in sales_order.items if row.item_code]
+    
+    # Build maps for comparison
+    shopify_item_map = {}
+    for item in shopify_items:
+        item_code = get_item_code(item)
+        if item_code:
+            shopify_item_map[item_code] = item
+    
+    so_item_map = {row.item_code: row for row in so_items}
+    
+    taxes_inclusive = order.get("taxes_included")
+    
+    # Find added items (in Shopify but not in ERP)
+    for item_code, shopify_item in shopify_item_map.items():
+        if item_code not in so_item_map:
+            changes["items_added"].append({
+                "item_code": item_code,
+                "item_name": shopify_item.get("name") or shopify_item.get("title"),
+                "quantity": cint(shopify_item.get("quantity")),
+                "price": _get_item_price(shopify_item, taxes_inclusive),
+                "properties": shopify_item.get("properties", []),
+                "sku": shopify_item.get("sku"),
+            })
+    
+    # Find removed items (in ERP but not in Shopify)
+    for item_code, so_row in so_item_map.items():
+        if item_code not in shopify_item_map:
+            changes["items_removed"].append({
+                "item_code": item_code,
+                "item_name": so_row.item_name,
+                "quantity": so_row.qty,
+                "price": so_row.rate,
+            })
+    
+    # Find modified items (quantity or price changed)
+    for item_code, shopify_item in shopify_item_map.items():
+        if item_code in so_item_map:
+            so_row = so_item_map[item_code]
+            expected_qty = cint(shopify_item.get("quantity"))
+            expected_rate = _get_item_price(shopify_item, taxes_inclusive)
+            
+            item_changes = {}
+            if so_row.qty != expected_qty:
+                item_changes["quantity"] = {
+                    "old": so_row.qty,
+                    "new": expected_qty
+                }
+            if flt(so_row.rate) != flt(expected_rate):
+                item_changes["price"] = {
+                    "old": flt(so_row.rate),
+                    "new": flt(expected_rate)
+                }
+            
+            # Check for property changes
+            shopify_props = shopify_item.get("properties", [])
+            if shopify_props:
+                # Store properties if they exist (we can't easily compare old vs new without storing previous state)
+                item_changes["properties"] = shopify_props
+                changes["properties_changed"].append({
+                    "item_code": item_code,
+                    "item_name": shopify_item.get("name") or shopify_item.get("title"),
+                    "properties": shopify_props,
+                })
+            
+            if item_changes:
+                changes["items_modified"].append({
+                    "item_code": item_code,
+                    "item_name": shopify_item.get("name") or shopify_item.get("title"),
+                    "changes": item_changes,
+                })
+    
+    # Address changes - detailed
+    shipping = order.get("shipping_address") or {}
+    billing = order.get("billing_address") or {}
+    
+    if _addresses_differ(order, sales_order, store_name):
+        address_changes = {}
+        
+        # Shipping address changes
+        if shipping and getattr(sales_order, "shipping_address_name", None):
+            try:
+                so_shipping = frappe.get_doc("Address", sales_order.shipping_address_name)
+                shipping_changes = {}
+                
+                if (so_shipping.address_line1 or "").strip() != (shipping.get("address1") or "").strip():
+                    shipping_changes["address_line1"] = {
+                        "old": so_shipping.address_line1,
+                        "new": shipping.get("address1")
+                    }
+                if (so_shipping.address_line2 or "").strip() != (shipping.get("address2") or "").strip():
+                    shipping_changes["address_line2"] = {
+                        "old": so_shipping.address_line2,
+                        "new": shipping.get("address2")
+                    }
+                if (so_shipping.city or "").strip() != (shipping.get("city") or "").strip():
+                    shipping_changes["city"] = {
+                        "old": so_shipping.city,
+                        "new": shipping.get("city")
+                    }
+                if (so_shipping.pincode or "").strip() != (shipping.get("zip") or "").strip():
+                    shipping_changes["pincode"] = {
+                        "old": so_shipping.pincode,
+                        "new": shipping.get("zip")
+                    }
+                if (so_shipping.country or "").strip() != (shipping.get("country") or "").strip():
+                    shipping_changes["country"] = {
+                        "old": so_shipping.country,
+                        "new": shipping.get("country")
+                    }
+                if (so_shipping.state or "").strip() != (shipping.get("province") or "").strip():
+                    shipping_changes["state"] = {
+                        "old": so_shipping.state,
+                        "new": shipping.get("province")
+                    }
+                
+                if shipping_changes:
+                    address_changes["shipping"] = shipping_changes
+            except Exception:
+                pass
+        
+        # Billing address changes
+        if billing and getattr(sales_order, "customer_address", None):
+            try:
+                so_billing = frappe.get_doc("Address", sales_order.customer_address)
+                billing_changes = {}
+                
+                if (so_billing.address_line1 or "").strip() != (billing.get("address1") or "").strip():
+                    billing_changes["address_line1"] = {
+                        "old": so_billing.address_line1,
+                        "new": billing.get("address1")
+                    }
+                if (so_billing.address_line2 or "").strip() != (billing.get("address2") or "").strip():
+                    billing_changes["address_line2"] = {
+                        "old": so_billing.address_line2,
+                        "new": billing.get("address2")
+                    }
+                if (so_billing.city or "").strip() != (billing.get("city") or "").strip():
+                    billing_changes["city"] = {
+                        "old": so_billing.city,
+                        "new": billing.get("city")
+                    }
+                if (so_billing.pincode or "").strip() != (billing.get("zip") or "").strip():
+                    billing_changes["pincode"] = {
+                        "old": so_billing.pincode,
+                        "new": billing.get("zip")
+                    }
+                if (so_billing.country or "").strip() != (billing.get("country") or "").strip():
+                    billing_changes["country"] = {
+                        "old": so_billing.country,
+                        "new": billing.get("country")
+                    }
+                if (so_billing.state or "").strip() != (billing.get("province") or "").strip():
+                    billing_changes["state"] = {
+                        "old": so_billing.state,
+                        "new": billing.get("province")
+                    }
+                
+                if billing_changes:
+                    address_changes["billing"] = billing_changes
+            except Exception:
+                pass
+        
+        if address_changes:
+            changes["address_changed"] = address_changes
+    
+    # Note changes
+    if _note_changed(order, sales_order, store_name):
+        changes["note_changed"] = True
+        shopify_note = (order.get("note") or "").strip()
+        
+        # Get old note from ERP comments
+        erp_note = ""
+        try:
+            comments = frappe.get_all(
+                "Comment",
+                filters={
+                    "reference_doctype": "Sales Order",
+                    "reference_name": sales_order.name,
+                    "comment_type": "Comment",
+                },
+                fields=["content"],
+                order_by="creation desc",
+                limit=5,
+            )
+            for c in comments:
+                content = (c.get("content") or "").strip()
+                if "Order Note:" in content:
+                    erp_note = content.replace("Order Note:", "").strip()
+                    break
+        except Exception:
+            pass
+        
+        changes["note_details"] = {
+            "old": erp_note,
+            "new": shopify_note,
+        }
+    
+    # Discount changes
+    if _discounts_differ(order, sales_order, store_name):
+        changes["discount_changed"] = True
+        shopify_total_discounts = flt(order.get("total_discounts") or 0)
+        
+        # Calculate ERP discount
+        erp_total_discounts = 0.0
+        for row in sales_order.items:
+            per_unit_disc = flt(getattr(row, ORDER_ITEM_DISCOUNT_FIELD, 0))
+            erp_total_discounts += per_unit_disc * flt(row.qty or 0)
+        
+        changes["discount_details"] = {
+            "old": erp_total_discounts,
+            "new": shopify_total_discounts,
+        }
+    
+    # Tags changes
+    shopify_tags = (order.get("tags") or "").strip()
+    if shopify_tags:
+        changes["tags_changed"] = True
+        changes["tags_details"] = {
+            "tags": shopify_tags,
+            "tag_list": [tag.strip() for tag in shopify_tags.split(",") if tag.strip()],
+        }
+    
+    return changes
+
+
 def is_valid_updated_order(order, sales_order, setting, store_name=None) -> bool:
-    """Return True only if orders/updated has changes we care about.
+    """Return True only if orders/edited has changes we care about.
 
     Categories:
     - B: Address/contact change
@@ -868,7 +1122,7 @@ def is_valid_updated_order(order, sales_order, setting, store_name=None) -> bool
     log_store2(
         "UPDATED-SUMMARY",
         f"""
-orders/updated change summary:
+orders/edited change summary:
   address_changed: {address_changed}
   line_items_changed: {line_items_changed}
   discounts_changed: {discounts_changed}
@@ -883,7 +1137,7 @@ orders/updated change summary:
 
 
 def order_updated(payload, request_id=None, store_name=None):
-    """Handler for orders/updated webhook.
+    """Handler for orders/edited webhook.
 
     This is intentionally conservative:
     - It only processes orders that already exist in ERP (no backfill/creation).
@@ -891,6 +1145,9 @@ def order_updated(payload, request_id=None, store_name=None):
       (categories B, C, D, E and notes). If not, it exits quietly.
     - It does NOT mutate ERP documents; it just logs interesting updates that
       your custom ERP logic can react to via Ecommerce Integration Log.
+    
+    Note: orders/edited only fires on actual order edits (items added/removed/modified, 
+    address changes, etc.) and not on irrelevant changes like tags, timeline posts, etc.
     """
     frappe.set_user("Administrator")
     frappe.flags.request_id = request_id
@@ -901,7 +1158,7 @@ def order_updated(payload, request_id=None, store_name=None):
         frappe.local.shopify_store_name = store_name
         log_store2(
             "UPDATED-1",
-            f"orders/updated received for store {store_name}, order_id={order.get('id')}",
+            f"orders/edited received for store {store_name}, order_id={order.get('id')}",
             store_name,
         )
 
@@ -911,13 +1168,15 @@ def order_updated(payload, request_id=None, store_name=None):
         if not sales_order:
             log_store2(
                 "UPDATED-SKIP-NO-SO",
-                f"Skipping orders/updated; Sales Order not found for Shopify Order ID {order.get('id')}",
+                f"Skipping order update/edit; Sales Order not found for Shopify Order ID {order.get('id')}",
                 store_name,
             )
-            create_shopify_log(
-                status="Invalid",
-                message="orders/updated skipped: Sales Order does not exist in ERP",
-            )
+            # Don't create a log for non-existent orders - delete the one created in process_request
+            if request_id:
+                try:
+                    frappe.delete_doc("Ecommerce Integration Log", request_id, ignore_permissions=True)
+                except Exception:
+                    pass
             return
 
         setting = frappe.get_doc(SETTING_DOCTYPE)
@@ -925,7 +1184,7 @@ def order_updated(payload, request_id=None, store_name=None):
         if not is_valid_updated_order(order, sales_order, setting, store_name):
             log_store2(
                 "UPDATED-SKIP-NOCHANGE",
-                "orders/updated has no relevant changes (B/C/D/E/notes); deleting log and skipping.",
+                "Order update/edit has no relevant changes (B/C/D/E/notes); deleting log and skipping.",
                 store_name,
             )
             # Delete the original Ecommerce Integration Log created in process_request
@@ -941,12 +1200,23 @@ def order_updated(payload, request_id=None, store_name=None):
             return
 
         # At this point we have an existing Sales Order and meaningful changes.
-        # We deliberately don't mutate ERP docs here; your custom logic can read
-        # the original Ecommerce Integration Log (kept intact) and decide what to do.
-        create_shopify_log(status="Success", message="orders/updated with relevant changes detected")
+        # Get detailed breakdown of what changed
+        detailed_changes = _get_detailed_changes(order, sales_order, setting, store_name)
+        
+        # Store detailed changes in the log for your ERP banner/notification system
+        create_shopify_log(
+            status="Success", 
+            message="Order update/edit with relevant changes detected",
+            response_data=detailed_changes  # Store detailed changes here for comparison
+        )
         log_store2(
             "UPDATED-OK",
-            f"orders/updated logged with relevant changes for Sales Order {sales_order.name}",
+            f"Order update/edit logged with relevant changes for Sales Order {sales_order.name}",
+            store_name,
+        )
+        log_store2(
+            "UPDATED-DETAILS",
+            f"Detailed changes: {json.dumps(detailed_changes, indent=2, default=str)}",
             store_name,
         )
 
