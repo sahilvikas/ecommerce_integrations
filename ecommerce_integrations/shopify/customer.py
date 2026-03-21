@@ -79,10 +79,23 @@ class ShopifyCustomer(EcommerceCustomer):
 		else:
 			exclude_in_update = ["address_title", "address_type"]
 			new_values = _map_address_fields(shopify_address, customer_name, address_type, email)
+			update_values = {k: v for k, v in new_values.items() if k not in exclude_in_update}
 
-			old_address.update({k: v for k, v in new_values.items() if k not in exclude_in_update})
+			# Avoid a write when there is no actual change; this reduces timestamp conflicts.
+			changed = any((old_address.get(k) or "") != (v or "") for k, v in update_values.items())
+			if not changed:
+				return
+
+			old_address.update(update_values)
 			old_address.flags.ignore_mandatory = True
-			old_address.save()
+			try:
+				old_address.save(ignore_permissions=True)
+			except frappe.TimestampMismatchError:
+				# Another worker updated the same address between read and save.
+				# Reload and apply the latest Shopify values without creating a hard failure.
+				old_address.reload()
+				old_address.update(update_values)
+				old_address.save(ignore_permissions=True, ignore_version=True)
 
 	def create_customer_contact(self, shopify_customer: dict[str, Any]) -> None:
 		if not (shopify_customer.get("first_name") and shopify_customer.get("email")):
