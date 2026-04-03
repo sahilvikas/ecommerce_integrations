@@ -93,7 +93,20 @@ def get_erpnext_item_code(
 	elif has_variants:
 		filters.update({"has_variants": 1})
 
-	return frappe.db.get_value("Ecommerce Item", filters, fieldname="erpnext_item_code")
+	result = frappe.db.get_value("Ecommerce Item", filters, fieldname="erpnext_item_code")
+
+	# Fallback: if variant_id didn't match, try without it.
+	# Custom/configurable products (e.g. cushions) create a unique
+	# Shopify variant per order, so the stored variant_id will never
+	# match subsequent orders.
+	if not result and variant_id:
+		fallback_filters = {
+			"integration": integration,
+			"integration_item_code": integration_item_code,
+		}
+		result = frappe.db.get_value("Ecommerce Item", fallback_filters, fieldname="erpnext_item_code")
+
+	return result
 
 
 def get_erpnext_item(
