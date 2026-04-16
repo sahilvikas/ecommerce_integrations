@@ -391,7 +391,7 @@ Processing item {idx + 1}:
             if item_code:
                 full_name = shopify_item.get("name") or shopify_item.get("title") or ""
                 if len(full_name) > 140:
-                    item_name = " ".join(full_name.split()[:3])
+                    item_name = (shopify_item.get("title") or full_name)[:140]
                 else:
                     item_name = full_name
                 item_dict = {
@@ -430,7 +430,7 @@ Processing item {idx + 1}:
                 
             full_name = shopify_item.get("name") or ""
             if len(full_name) > 140:
-                item_name = " ".join(full_name.split()[:3])
+                item_name = (shopify_item.get("title") or full_name)[:140]
             else:
                 item_name = full_name
             item_dict = {
