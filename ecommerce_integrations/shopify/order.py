@@ -389,10 +389,14 @@ Processing item {idx + 1}:
             item_code = get_item_code(shopify_item)
             log_store2(f"ITEMS-2-{idx}-NOID", f"No product_id, mapped to: {item_code}", store_name)
             if item_code:
-                items.append(
-                    {
+                full_name = shopify_item.get("name") or shopify_item.get("title") or ""
+                if len(full_name) > 140:
+                    item_name = " ".join(full_name.split()[:3])
+                else:
+                    item_name = full_name
+                item_dict = {
                         "item_code": item_code,
-                        "item_name": shopify_item.get("name") or shopify_item.get("title"),
+                        "item_name": item_name,
                         "rate": _get_item_price(shopify_item, taxes_inclusive),
                         "delivery_date": delivery_date,
                         "qty": shopify_item.get("quantity"),
@@ -402,7 +406,9 @@ Processing item {idx + 1}:
                             _get_total_discount(shopify_item) / cint(shopify_item.get("quantity"))
                         ),
                     }
-                )
+                if len(full_name) > 140:
+                    item_dict["description"] = full_name
+                items.append(item_dict)
             continue
         
         # Original logic for items with product_id
@@ -422,10 +428,14 @@ Processing item {idx + 1}:
                 log_store2(f"ITEMS-2-{idx}-NOCODE", f"Could not get item_code!", store_name)
                 continue
                 
-            items.append(
-                {
+            full_name = shopify_item.get("name") or ""
+            if len(full_name) > 140:
+                item_name = " ".join(full_name.split()[:3])
+            else:
+                item_name = full_name
+            item_dict = {
                     "item_code": item_code,
-                    "item_name": shopify_item.get("name"),
+                    "item_name": item_name,
                     "rate": _get_item_price(shopify_item, taxes_inclusive),
                     "delivery_date": delivery_date,
                     "qty": shopify_item.get("quantity"),
@@ -435,7 +445,9 @@ Processing item {idx + 1}:
                         _get_total_discount(shopify_item) / cint(shopify_item.get("quantity"))
                     ),
                 }
-            )
+            if len(full_name) > 140:
+                item_dict["description"] = full_name
+            items.append(item_dict)
         else:
             items = []
 
