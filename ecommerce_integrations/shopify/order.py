@@ -129,6 +129,7 @@ Skipping creation.
         shopify_customer = order.get("customer") if order.get("customer") is not None else {}
         shopify_customer["billing_address"] = order.get("billing_address", "")
         shopify_customer["shipping_address"] = order.get("shipping_address", "")
+        shopify_customer["contact_email"] = order.get("contact_email")  # ← ADD THIS
         customer_id = shopify_customer.get("id")
         
         log_store2("BG-4a", f"""

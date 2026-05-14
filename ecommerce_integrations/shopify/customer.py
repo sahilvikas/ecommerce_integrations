@@ -23,7 +23,7 @@ class ShopifyCustomer(EcommerceCustomer):
 
 		customer_name = cstr(customer.get("first_name")) + " " + cstr(customer.get("last_name"))
 		if len(customer_name.strip()) == 0:
-			customer_name = customer.get("email")
+			customer_name = customer.get("contact_email") or customer.get("email")
 
 		customer_group = self.setting.customer_group
 		super().sync_customer(customer_name, customer_group)
@@ -31,13 +31,15 @@ class ShopifyCustomer(EcommerceCustomer):
 		billing_address = customer.get("billing_address", {}) or customer.get("default_address")
 		shipping_address = customer.get("shipping_address", {})
 
+		preferred_email = customer.get("contact_email") or customer.get("email")
+
 		if billing_address:
 			self.create_customer_address(
-				customer_name, billing_address, address_type="Billing", email=customer.get("email")
+				customer_name, billing_address, address_type="Billing", email=preferred_email
 			)
 		if shipping_address:
 			self.create_customer_address(
-				customer_name, shipping_address, address_type="Shipping", email=customer.get("email")
+				customer_name, shipping_address, address_type="Shipping", email=preferred_email
 			)
 
 		self.create_customer_contact(customer)
@@ -58,7 +60,7 @@ class ShopifyCustomer(EcommerceCustomer):
 		shipping_address = customer.get("shipping_address", {})
 
 		customer_name = cstr(customer.get("first_name")) + " " + cstr(customer.get("last_name"))
-		email = customer.get("email")
+		email = customer.get("contact_email") or customer.get("email")
 
 		if billing_address:
 			self._update_existing_address(customer_name, billing_address, "Billing", email)
@@ -98,7 +100,9 @@ class ShopifyCustomer(EcommerceCustomer):
 				old_address.save(ignore_permissions=True, ignore_version=True)
 
 	def create_customer_contact(self, shopify_customer: dict[str, Any]) -> None:
-		if not (shopify_customer.get("first_name") and shopify_customer.get("email")):
+		preferred_email = shopify_customer.get("contact_email") or shopify_customer.get("email")
+
+		if not (shopify_customer.get("first_name") and preferred_email):
 			return
 
 		contact_fields = {
@@ -108,8 +112,8 @@ class ShopifyCustomer(EcommerceCustomer):
 			"unsubscribed": not shopify_customer.get("accepts_marketing"),
 		}
 
-		if shopify_customer.get("email"):
-			contact_fields["email_ids"] = [{"email_id": shopify_customer.get("email"), "is_primary": True}]
+		if preferred_email:
+			contact_fields["email_ids"] = [{"email_id": preferred_email, "is_primary": True}]
 
 		phone_no = shopify_customer.get("phone") or shopify_customer.get("default_address", {}).get("phone")
 
