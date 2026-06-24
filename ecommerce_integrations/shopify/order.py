@@ -933,6 +933,17 @@ def order_updated(payload, request_id=None, store_name=None):
             )
             return
 
+        # Detect cancellation in orders/updated payload
+        if order.get("cancelled_at") or order.get("cancel_reason"):
+            log_store2("UPDATED-CANCEL", f"Order is cancelled! cancel_reason={order.get('cancel_reason')}, calling handle_shopify_cancellation", store_name)
+            try:
+                frappe.call("handle_shopify_cancellation", sales_order=sales_order.name)
+                create_shopify_log(status="Success", message="orders/updated: cancellation detected and processed")
+            except Exception as cancel_err:
+                log_store2("UPDATED-CANCEL-ERR", f"handle_shopify_cancellation failed: {cancel_err}", store_name)
+                create_shopify_log(status="Error", exception=cancel_err)
+            return
+
         setting = frappe.get_doc(SETTING_DOCTYPE)
 
         if not is_valid_updated_order(order, sales_order, setting, store_name):
@@ -990,21 +1001,28 @@ def cancel_order(payload, request_id=None, store_name=None):
             create_shopify_log(status="Invalid", message="Sales Order does not exist")
             return
 
-        sales_invoice = frappe.db.get_value("Sales Invoice", filters={ORDER_ID_FIELD: order_id})
-        delivery_notes = frappe.db.get_list("Delivery Note", filters={ORDER_ID_FIELD: order_id})
+        # Route to custom cancellation handler
+        try:
+            frappe.call("handle_shopify_cancellation", sales_order=sales_order.name)
+            log_store2("CANCEL-OK", f"handle_shopify_cancellation called for {sales_order.name}", store_name)
+        except Exception as cancel_err:
+            log_store2("CANCEL-HANDLER-ERR", f"handle_shopify_cancellation failed: {cancel_err}, falling back", store_name)
+            # Fallback to original behavior
+            sales_invoice = frappe.db.get_value("Sales Invoice", filters={ORDER_ID_FIELD: order_id})
+            delivery_notes = frappe.db.get_list("Delivery Note", filters={ORDER_ID_FIELD: order_id})
 
-        if sales_invoice:
-            frappe.db.set_value("Sales Invoice", sales_invoice, ORDER_STATUS_FIELD, order_status)
+            if sales_invoice:
+                frappe.db.set_value("Sales Invoice", sales_invoice, ORDER_STATUS_FIELD, order_status)
 
-        for dn in delivery_notes:
-            frappe.db.set_value("Delivery Note", dn.name, ORDER_STATUS_FIELD, order_status)
+            for dn in delivery_notes:
+                frappe.db.set_value("Delivery Note", dn.name, ORDER_STATUS_FIELD, order_status)
 
-        if not sales_invoice and not delivery_notes and sales_order.docstatus == 1:
-            sales_order.cancel()
-            log_store2("CANCEL-OK", f"Sales Order {sales_order.name} cancelled", store_name)
-        else:
-            frappe.db.set_value("Sales Order", sales_order.name, ORDER_STATUS_FIELD, order_status)
-            log_store2("CANCEL-STATUS", f"Sales Order {sales_order.name} status updated", store_name)
+            if not sales_invoice and not delivery_notes and sales_order.docstatus == 1:
+                sales_order.cancel()
+                log_store2("CANCEL-FALLBACK-OK", f"Sales Order {sales_order.name} cancelled via fallback", store_name)
+            else:
+                frappe.db.set_value("Sales Order", sales_order.name, ORDER_STATUS_FIELD, order_status)
+                log_store2("CANCEL-FALLBACK-STATUS", f"Sales Order {sales_order.name} status updated via fallback", store_name)
 
     except Exception as e:
         log_store2("CANCEL-ERROR", f"Error: {str(e)}\n{traceback.format_exc()}", store_name)
