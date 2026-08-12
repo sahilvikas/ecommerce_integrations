@@ -521,6 +521,8 @@ Kwargs: payload (order data), request_id={log.name}, store_name={store_name}
             queue="short",
             timeout=300,
             is_async=True,
+            job_id=f"shopify-{event}-{data['id']}",
+            deduplicate=True,
             **{"payload": data, "request_id": log.name, "store_name": store_name},
         )
         log_store2("13-OK", f"""

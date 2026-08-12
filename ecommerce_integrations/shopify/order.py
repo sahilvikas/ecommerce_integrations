@@ -935,12 +935,33 @@ def order_updated(payload, request_id=None, store_name=None):
 
         # Detect cancellation in orders/updated payload
         if order.get("cancelled_at") or order.get("cancel_reason"):
+            so_name = sales_order.name
+
+            # Guard against re-processing: every later orders/updated payload for a
+            # cancelled order still carries cancelled_at/cancel_reason.
+            if frappe.db.exists("Cancelled Order", {"sales_order": so_name}):
+                log_store2("UPDATED-CANCEL-SKIP", f"Cancelled Order already exists for {so_name}, skipping", store_name)
+                return
+
             log_store2("UPDATED-CANCEL", f"Order is cancelled! cancel_reason={order.get('cancel_reason')}, calling handle_shopify_cancellation", store_name)
+
+            # Mark the Sales Order before invoking the handler so the cancellation is
+            # visible to ops (and to the Shopify Cancel Monitor) even if it fails.
+            frappe.db.set_value("Sales Order", so_name, "custom_ops_status", "CANCEL REQUEST", update_modified=False)
+            frappe.db.set_value("Sales Order", so_name, ORDER_STATUS_FIELD, "cancelled", update_modified=False)
+            frappe.db.commit()
+
             try:
-                frappe.call("handle_shopify_cancellation", sales_order=sales_order.name)
+                frappe.form_dict.update({"sales_order": so_name})
+                from frappe.handler import execute_cmd
+
+                execute_cmd("handle_shopify_cancellation")
                 create_shopify_log(status="Success", message="orders/updated: cancellation detected and processed")
             except Exception as cancel_err:
-                log_store2("UPDATED-CANCEL-ERR", f"handle_shopify_cancellation failed: {cancel_err}", store_name)
+                frappe.log_error(
+                    title="[SHOPIFY] orders/updated cancellation failed",
+                    message=f"Store: {store_name}\nSales Order: {so_name}\nError: {cancel_err}\n\n{traceback.format_exc()}",
+                )
                 create_shopify_log(status="Error", exception=cancel_err)
             return
 
@@ -1001,12 +1022,32 @@ def cancel_order(payload, request_id=None, store_name=None):
             create_shopify_log(status="Invalid", message="Sales Order does not exist")
             return
 
+        so_name = sales_order.name
+
+        # Guard against re-processing: orders/cancelled may be redelivered, and the
+        # orders/updated handler may already have processed this cancellation.
+        if frappe.db.exists("Cancelled Order", {"sales_order": so_name}):
+            log_store2("CANCEL-SKIP", f"Cancelled Order already exists for {so_name}, skipping", store_name)
+            return
+
+        # Mark the Sales Order before invoking the handler so the cancellation is
+        # visible to ops (and to the Shopify Cancel Monitor) even if it fails.
+        frappe.db.set_value("Sales Order", so_name, "custom_ops_status", "CANCEL REQUEST", update_modified=False)
+        frappe.db.set_value("Sales Order", so_name, ORDER_STATUS_FIELD, "cancelled", update_modified=False)
+        frappe.db.commit()
+
         # Route to custom cancellation handler
         try:
-            frappe.call("handle_shopify_cancellation", sales_order=sales_order.name)
-            log_store2("CANCEL-OK", f"handle_shopify_cancellation called for {sales_order.name}", store_name)
+            frappe.form_dict.update({"sales_order": so_name})
+            from frappe.handler import execute_cmd
+
+            execute_cmd("handle_shopify_cancellation")
+            log_store2("CANCEL-OK", f"handle_shopify_cancellation called for {so_name}", store_name)
         except Exception as cancel_err:
-            log_store2("CANCEL-HANDLER-ERR", f"handle_shopify_cancellation failed: {cancel_err}, falling back", store_name)
+            frappe.log_error(
+                title="[SHOPIFY] orders/cancelled cancellation failed",
+                message=f"Store: {store_name}\nSales Order: {so_name}\nError: {cancel_err}\n\n{traceback.format_exc()}",
+            )
             # Fallback to original behavior
             sales_invoice = frappe.db.get_value("Sales Invoice", filters={ORDER_ID_FIELD: order_id})
             delivery_notes = frappe.db.get_list("Delivery Note", filters={ORDER_ID_FIELD: order_id})
@@ -1023,6 +1064,10 @@ def cancel_order(payload, request_id=None, store_name=None):
             else:
                 frappe.db.set_value("Sales Order", sales_order.name, ORDER_STATUS_FIELD, order_status)
                 log_store2("CANCEL-FALLBACK-STATUS", f"Sales Order {sales_order.name} status updated via fallback", store_name)
+
+            # The fallback above writes financial_status into ORDER_STATUS_FIELD; restore
+            # "cancelled" so the Shopify Cancel Monitor can still pick this order up.
+            frappe.db.set_value("Sales Order", so_name, ORDER_STATUS_FIELD, "cancelled", update_modified=False)
 
     except Exception as e:
         log_store2("CANCEL-ERROR", f"Error: {str(e)}\n{traceback.format_exc()}", store_name)
